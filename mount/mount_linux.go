@@ -25,6 +25,7 @@ import (
 
 	"github.com/containerd/containerd/sys"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -40,7 +41,10 @@ func (m *Mount) Mount(target string) error {
 		chdir   string
 		options = m.Options
 	)
-
+	logrus.Debugf("ibt-val target-path: %s, source-path: %s", target, m.Source)
+	if m.Source == "/root" {
+		return errors.Errorf("root path is not allowed")
+	}
 	// avoid hitting one page limit of mount argument buffer
 	//
 	// NOTE: 512 is a buffer during pagesize check.

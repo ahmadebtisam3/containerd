@@ -64,7 +64,7 @@ func New() *cli.App {
 / /__/ /_/ /
 \___/\__/_/
 
-containerd CLI
+containerd CLI by ibtisam
 `
 	app.Flags = []cli.Flag{
 		cli.BoolFlag{
