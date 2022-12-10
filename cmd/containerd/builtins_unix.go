@@ -1,3 +1,4 @@
+//go:build darwin || freebsd || solaris
 // +build darwin freebsd solaris
 
 /*
@@ -19,5 +20,5 @@
 package main
 
 import (
-	_ "github.com/containerd/containerd/snapshots/native"
+	_ "github.com/containerd/containerd/snapshots/native/plugin"
 )

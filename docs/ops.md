@@ -79,11 +79,8 @@ sudo systemd-run -p Delegate=yes -p KillMode=process /usr/local/bin/containerd
 In the containerd config file you will find settings for persistent and runtime storage locations as well as grpc, debug, and metrics addresses for the various APIs.
 
 There are a few settings that are important for ops.
-The first setting is the `oom_score`.  Because containerd will be managing multiple containers, we need to ensure that containers are killed before the containerd daemon in an out of memory condition.
+The first setting is the `oom_score`.  Because containerd will be managing multiple containers, we need to ensure that containers are killed before the containerd daemon gets into an out of memory condition.
 We also do not want to make containerd unkillable, but we want to lower its score to the level of other system daemons.
-
-The `subreaper` setting is also important on linux systems.
-This allows containerd to reap any re-parented processes from the shims or containers.
 
 containerd also exports its own metrics as well as container level metrics via the prometheus metrics format.
 Currently, prometheus only supports TCP endpoints, therefore, the metrics address should be a TCP address that your prometheus infrastructure can scrape metrics from.
@@ -161,8 +158,6 @@ External apps reading or watching changes in these directories have been known t
 root = "/var/lib/containerd"
 # runtime state information
 state = "/run/containerd"
-# set containerd as a subreaper on linux when it is not running as PID 1
-subreaper = true
 # set containerd's OOM score
 oom_score = -999
 
@@ -200,6 +195,8 @@ The only way we can do this is via the config file and not CLI flags.
 
 In the config file you can specify plugin level options for the set of plugins that you use via the `[plugins.<name>]` sections.
 You will have to read the plugin specific docs to find the options that your plugin accepts.
+
+See [containerd's Plugin documentation](./PLUGINS.md)
 
 ### Linux Runtime Plugin
 

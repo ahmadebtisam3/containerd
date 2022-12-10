@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -20,7 +21,6 @@ package v1
 
 import (
 	"context"
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -33,22 +33,21 @@ import (
 	eventstypes "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/pkg/oom"
+	oomv1 "github.com/containerd/containerd/pkg/oom/v1"
 	"github.com/containerd/containerd/pkg/process"
 	"github.com/containerd/containerd/pkg/stdio"
 	"github.com/containerd/containerd/runtime/v2/runc"
 	"github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskAPI "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/containerd/containerd/sys/reaper"
 	runcC "github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
 	ptypes "github.com/gogo/protobuf/types"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -61,7 +60,7 @@ var (
 
 // New returns a new shim service that can be used via GRPC
 func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func()) (shim.Shim, error) {
-	ep, err := oom.New(publisher)
+	ep, err := oomv1.New(publisher)
 	if err != nil {
 		return nil, err
 	}
@@ -70,12 +69,12 @@ func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func
 		id:      id,
 		context: ctx,
 		events:  make(chan interface{}, 128),
-		ec:      shim.Default.Subscribe(),
+		ec:      reaper.Default.Subscribe(),
 		ep:      ep,
 		cancel:  shutdown,
 	}
 	go s.processExits()
-	runcC.Monitor = shim.Default
+	runcC.Monitor = reaper.Default
 	if err := s.initPlatform(); err != nil {
 		shutdown()
 		return nil, errors.Wrap(err, "failed to initialized platform behavior")
@@ -93,7 +92,7 @@ type service struct {
 	events   chan interface{}
 	platform stdio.Platform
 	ec       chan runcC.Exit
-	ep       *oom.Epoller
+	ep       oom.Watcher
 
 	id        string
 	container *runc.Container
@@ -101,7 +100,7 @@ type service struct {
 	cancel func()
 }
 
-func newCommand(ctx context.Context, id, containerdBinary, containerdAddress string) (*exec.Cmd, error) {
+func newCommand(ctx context.Context, id, containerdBinary, containerdAddress, containerdTTRPCAddress string) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -128,33 +127,51 @@ func newCommand(ctx context.Context, id, containerdBinary, containerdAddress str
 	return cmd, nil
 }
 
-func (s *service) StartShim(ctx context.Context, id, containerdBinary, containerdAddress string) (string, error) {
-	cmd, err := newCommand(ctx, id, containerdBinary, containerdAddress)
+func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (_ string, retErr error) {
+	cmd, err := newCommand(ctx, opts.ID, opts.ContainerdBinary, opts.Address, opts.TTRPCAddress)
 	if err != nil {
 		return "", err
 	}
-	address, err := shim.SocketAddress(ctx, id)
+	address, err := shim.SocketAddress(ctx, opts.Address, opts.ID)
 	if err != nil {
 		return "", err
 	}
 	socket, err := shim.NewSocket(address)
 	if err != nil {
+		if !shim.SocketEaddrinuse(err) {
+			return "", err
+		}
+		if err := shim.RemoveSocket(address); err != nil {
+			return "", errors.Wrap(err, "remove already used socket")
+		}
+		if socket, err = shim.NewSocket(address); err != nil {
+			return "", err
+		}
+	}
+	defer func() {
+		if retErr != nil {
+			socket.Close()
+			_ = shim.RemoveSocket(address)
+		}
+	}()
+	// make sure that reexec shim-v2 binary use the value if need
+	if err := shim.WriteAddress("address", address); err != nil {
 		return "", err
 	}
-	defer socket.Close()
+
 	f, err := socket.File()
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 
 	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
 
 	if err := cmd.Start(); err != nil {
+		f.Close()
 		return "", err
 	}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			cmd.Process.Kill()
 		}
 	}()
@@ -163,12 +180,9 @@ func (s *service) StartShim(ctx context.Context, id, containerdBinary, container
 	if err := shim.WritePidFile("shim.pid", cmd.Process.Pid); err != nil {
 		return "", err
 	}
-	if err := shim.WriteAddress("address", address); err != nil {
-		return "", err
-	}
 	if data, err := ioutil.ReadAll(os.Stdin); err == nil {
 		if len(data) > 0 {
-			var any types.Any
+			var any ptypes.Any
 			if err := proto.Unmarshal(data, &any); err != nil {
 				return "", err
 			}
@@ -198,6 +212,12 @@ func (s *service) StartShim(ctx context.Context, id, containerdBinary, container
 }
 
 func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) {
+	if address, err := shim.ReadAddress("address"); err == nil {
+		if err = shim.RemoveSocket(address); err != nil {
+			return nil, err
+		}
+	}
+
 	path, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -210,7 +230,16 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	if err != nil {
 		return nil, err
 	}
-	r := process.NewRunc(process.RuncRoot, path, ns, runtime, "", false)
+	opts, err := runc.ReadOptions(path)
+	if err != nil {
+		return nil, err
+	}
+	root := process.RuncRoot
+	if opts != nil && opts.Root != "" {
+		root = opts.Root
+	}
+
+	r := process.NewRunc(root, path, ns, runtime, "", false)
 	if err := r.Delete(ctx, s.id, &runcC.DeleteOpts{
 		Force: true,
 	}); err != nil {
@@ -219,9 +248,16 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	if err := mount.UnmountAll(filepath.Join(path, "rootfs"), 0); err != nil {
 		logrus.WithError(err).Warn("failed to cleanup rootfs mount")
 	}
+
+	pid, err := runcC.ReadPidFile(filepath.Join(path, process.InitPidFile))
+	if err != nil {
+		logrus.WithError(err).Warn("failed to read init pid file")
+	}
+
 	return &taskAPI.DeleteResponse{
 		ExitedAt:   time.Now(),
 		ExitStatus: 128 + uint32(unix.SIGKILL),
+		Pid:        uint32(pid),
 	}, nil
 }
 
@@ -270,11 +306,15 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 		s.eventSendMu.Unlock()
 		return nil, errdefs.ToGRPC(err)
 	}
-	if err := s.ep.Add(container.ID, container.Cgroup()); err != nil {
-		logrus.WithError(err).Error("add cg to OOM monitor")
-	}
 	switch r.ExecID {
 	case "":
+		if cg, ok := container.Cgroup().(cgroups.Cgroup); ok {
+			if err := s.ep.Add(container.ID, cg); err != nil {
+				logrus.WithError(err).Error("add cg to OOM monitor")
+			}
+		} else {
+			logrus.WithError(errdefs.ErrNotImplemented).Error("add cg to OOM monitor")
+		}
 		s.send(&eventstypes.TaskStart{
 			ContainerID: container.ID,
 			Pid:         uint32(p.Pid()),
@@ -538,13 +578,22 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 }
 
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ptypes.Empty, error) {
+	// please make sure that temporary resource has been cleanup
+	// before shutdown service.
 	s.cancel()
 	close(s.events)
 	return empty, nil
 }
 
 func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.StatsResponse, error) {
-	cg := s.container.Cgroup()
+	cgx := s.container.Cgroup()
+	if cgx == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
+	}
+	cg, ok := cgx.(cgroups.Cgroup)
+	if !ok {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotImplemented, "cgroup v2 not implemented for Stats")
+	}
 	if cg == nil {
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
 	}
@@ -583,14 +632,9 @@ func (s *service) checkProcesses(e runcC.Exit) {
 		return
 	}
 
-	shouldKillAll, err := shouldKillAllOnExit(container.Bundle)
-	if err != nil {
-		log.G(s.context).WithError(err).Error("failed to check shouldKillAll")
-	}
-
 	for _, p := range container.All() {
 		if p.Pid() == e.Pid {
-			if shouldKillAll {
+			if runc.ShouldKillAllOnExit(s.context, container.Bundle) {
 				if ip, ok := p.(*process.Init); ok {
 					// Ensure all children are killed
 					if err := ip.KillAll(s.context); err != nil {
@@ -610,25 +654,6 @@ func (s *service) checkProcesses(e runcC.Exit) {
 			return
 		}
 	}
-}
-
-func shouldKillAllOnExit(bundlePath string) (bool, error) {
-	var bundleSpec specs.Spec
-	bundleConfigContents, err := ioutil.ReadFile(filepath.Join(bundlePath, "config.json"))
-	if err != nil {
-		return false, err
-	}
-	json.Unmarshal(bundleConfigContents, &bundleSpec)
-
-	if bundleSpec.Linux != nil {
-		for _, ns := range bundleSpec.Linux.Namespaces {
-			if ns.Type == specs.PIDNamespace {
-				return false, nil
-			}
-		}
-	}
-
-	return true, nil
 }
 
 func (s *service) getContainerPids(ctx context.Context, id string) ([]uint32, error) {

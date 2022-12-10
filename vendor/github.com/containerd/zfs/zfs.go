@@ -20,12 +20,11 @@ package zfs
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/storage"
 	zfs "github.com/mistifyio/go-zfs"
@@ -37,19 +36,10 @@ const (
 	//	active := filepath.Join(dataset.Name, id)
 	//      committed := active + "@" + snapshotSuffix
 	snapshotSuffix = "snapshot"
-)
 
-func init() {
-	plugin.Register(&plugin.Registration{
-		Type: plugin.SnapshotPlugin,
-		ID:   "zfs",
-		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
-			ic.Meta.Exports["root"] = ic.Root
-			return NewSnapshotter(ic.Root)
-		},
-	})
-}
+	// Using this typed MaxInt64 to prevent integer overlow on 32bit
+	maxSnapshotSize int64 = math.MaxInt64
+)
 
 type snapshotter struct {
 	dataset *zfs.Dataset
@@ -66,7 +56,7 @@ func NewSnapshotter(root string) (snapshots.Snapshotter, error) {
 		return nil, err
 	}
 	if m.FSType != "zfs" {
-		return nil, errors.Wrapf(plugin.ErrSkipPlugin, "path %s must be a zfs filesystem to be used with the zfs snapshotter", root)
+		return nil, errors.Errorf("path %s must be a zfs filesystem to be used with the zfs snapshotter", root)
 	}
 	dataset, err := zfs.GetDataset(m.Source)
 	if err != nil {
@@ -119,7 +109,7 @@ func (z *snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, err
 	if err != nil {
 		return snapshots.Info{}, err
 	}
-	defer t.Rollback()
+	defer t.Rollback() //nolint:errcheck
 	_, info, _, err := storage.GetInfo(ctx, key)
 	if err != nil {
 		return snapshots.Info{}, err
@@ -130,17 +120,50 @@ func (z *snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, err
 
 // Usage retrieves the disk usage of the top-level snapshot.
 func (z *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, error) {
-	return snapshots.Usage{}, errors.New("zfs does not implement Usage() yet")
+	return z.usage(ctx, key)
+}
+
+func (z *snapshotter) usage(ctx context.Context, key string) (snapshots.Usage, error) {
+	ctx, t, err := z.ms.TransactionContext(ctx, false)
+	if err != nil {
+		return snapshots.Usage{}, err
+	}
+	id, info, usage, err := storage.GetInfo(ctx, key)
+	t.Rollback() //nolint:errcheck
+
+	if err != nil {
+		return snapshots.Usage{}, err
+	}
+
+	if info.Kind == snapshots.KindActive {
+		activeName := filepath.Join(z.dataset.Name, id)
+		sDataset, err := zfs.GetDataset(activeName)
+
+		if err != nil {
+			return snapshots.Usage{}, err
+		}
+
+		if int64(sDataset.Used) > maxSnapshotSize {
+			return snapshots.Usage{}, errors.Errorf("Dataset size exceeds maximum snapshot size of %d bytes", maxSnapshotSize)
+		}
+
+		usage = snapshots.Usage{
+			Size:   int64(sDataset.Used),
+			Inodes: -1,
+		}
+	}
+
+	return usage, nil
 }
 
 // Walk the committed snapshots.
-func (z *snapshotter) Walk(ctx context.Context, fn func(context.Context, snapshots.Info) error) error {
+func (z *snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters ...string) error {
 	ctx, t, err := z.ms.TransactionContext(ctx, false)
 	if err != nil {
 		return err
 	}
-	defer t.Rollback()
-	return storage.WalkInfo(ctx, fn)
+	defer t.Rollback() //nolint:errcheck
+	return storage.WalkInfo(ctx, fn, filters...)
 }
 
 func (z *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -215,6 +238,11 @@ func (z *snapshotter) mounts(dataset *zfs.Dataset, readonly bool) ([]mount.Mount
 }
 
 func (z *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) (err error) {
+	usage, err := z.usage(ctx, key)
+	if err != nil {
+		return errors.Wrap(err, "failed to compute usage")
+	}
+
 	ctx, t, err := z.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return err
@@ -227,7 +255,7 @@ func (z *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 	}()
 
-	id, err := storage.CommitActive(ctx, key, name, snapshots.Usage{})
+	id, err := storage.CommitActive(ctx, key, name, usage, opts...)
 	if err != nil {
 		return errors.Wrap(err, "failed to commit")
 	}
@@ -263,7 +291,7 @@ func (z *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 		return nil, err
 	}
 	s, err := storage.GetSnapshot(ctx, key)
-	t.Rollback()
+	t.Rollback() //nolint:errcheck
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get active snapshot")
 	}
@@ -298,18 +326,20 @@ func (z *snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 	datasetName := filepath.Join(z.dataset.Name, id)
 	if k == snapshots.KindCommitted {
-		datasetName += "@" + snapshotSuffix
+		snapshotName := datasetName + "@" + snapshotSuffix
+		snapshot, err := zfs.GetDataset(snapshotName)
+		if err != nil {
+			return err
+		}
+		if err = destroySnapshot(snapshot); err != nil {
+			return err
+		}
 	}
 	dataset, err := zfs.GetDataset(datasetName)
 	if err != nil {
 		return err
 	}
-	if k == snapshots.KindCommitted {
-		err = destroySnapshot(dataset)
-	} else {
-		err = destroy(dataset)
-	}
-	if err != nil {
+	if err = destroy(dataset); err != nil {
 		return err
 	}
 	err = t.Commit()
@@ -325,7 +355,7 @@ func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 
 	info, err = storage.UpdateInfo(ctx, info, fieldpaths...)
 	if err != nil {
-		t.Rollback()
+		t.Rollback() //nolint:errcheck
 		return snapshots.Info{}, err
 	}
 

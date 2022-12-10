@@ -31,31 +31,57 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 )
+
+type refKeyPrefix struct{}
+
+// WithMediaTypeKeyPrefix adds a custom key prefix for a media type which is used when storing
+// data in the content store from the FetchHandler.
+//
+// Used in `MakeRefKey` to determine what the key prefix should be.
+func WithMediaTypeKeyPrefix(ctx context.Context, mediaType, prefix string) context.Context {
+	var values map[string]string
+	if v := ctx.Value(refKeyPrefix{}); v != nil {
+		values = v.(map[string]string)
+	} else {
+		values = make(map[string]string)
+	}
+
+	values[mediaType] = prefix
+	return context.WithValue(ctx, refKeyPrefix{}, values)
+}
 
 // MakeRefKey returns a unique reference for the descriptor. This reference can be
 // used to lookup ongoing processes related to the descriptor. This function
 // may look to the context to namespace the reference appropriately.
 func MakeRefKey(ctx context.Context, desc ocispec.Descriptor) string {
-	// TODO(stevvooe): Need better remote key selection here. Should be a
-	// product of the context, which may include information about the ongoing
-	// fetch process.
-	switch desc.MediaType {
-	case images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
-		return "manifest-" + desc.Digest.String()
-	case images.MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex:
-		return "index-" + desc.Digest.String()
-	case images.MediaTypeDockerSchema2Layer, images.MediaTypeDockerSchema2LayerGzip,
-		images.MediaTypeDockerSchema2LayerForeign, images.MediaTypeDockerSchema2LayerForeignGzip,
-		ocispec.MediaTypeImageLayer, ocispec.MediaTypeImageLayerGzip,
-		ocispec.MediaTypeImageLayerNonDistributable, ocispec.MediaTypeImageLayerNonDistributableGzip,
-		images.MediaTypeDockerSchema2LayerEnc, images.MediaTypeDockerSchema2LayerGzipEnc:
-		return "layer-" + desc.Digest.String()
-	case images.MediaTypeDockerSchema2Config, ocispec.MediaTypeImageConfig:
-		return "config-" + desc.Digest.String()
+	key := desc.Digest.String()
+	if desc.Annotations != nil {
+		if name, ok := desc.Annotations[ocispec.AnnotationRefName]; ok {
+			key = fmt.Sprintf("%s@%s", name, desc.Digest.String())
+		}
+	}
+
+	if v := ctx.Value(refKeyPrefix{}); v != nil {
+		values := v.(map[string]string)
+		if prefix := values[desc.MediaType]; prefix != "" {
+			return prefix + "-" + key
+		}
+	}
+
+	switch mt := desc.MediaType; {
+	case mt == images.MediaTypeDockerSchema2Manifest || mt == ocispec.MediaTypeImageManifest:
+		return "manifest-" + key
+	case mt == images.MediaTypeDockerSchema2ManifestList || mt == ocispec.MediaTypeImageIndex:
+		return "index-" + key
+	case images.IsLayerType(mt):
+		return "layer-" + key
+	case images.IsKnownConfig(mt):
+		return "config-" + key
 	default:
-		log.G(ctx).Warnf("reference for unknown type: %s", desc.MediaType)
-		return "unknown-" + desc.Digest.String()
+		log.G(ctx).Warnf("reference for unknown type: %s", mt)
+		return "unknown-" + key
 	}
 }
 
@@ -97,6 +123,12 @@ func fetch(ctx context.Context, ingester content.Ingester, fetcher Fetcher, desc
 		return err
 	}
 
+	if desc.Size == 0 {
+		// most likely a poorly configured registry/web front end which responded with no
+		// Content-Length header; unable (not to mention useless) to commit a 0-length entry
+		// into the content store. Error out here otherwise the error sent back is confusing
+		return errors.Wrapf(errdefs.ErrInvalidArgument, "unable to fetch descriptor (%s) which reports content size of zero", desc.Digest)
+	}
 	if ws.Offset == desc.Size {
 		// If writer is already complete, commit and return
 		err := cw.Commit(ctx, desc.Size, desc.Digest)
@@ -133,7 +165,15 @@ func PushHandler(pusher Pusher, provider content.Provider) images.HandlerFunc {
 func push(ctx context.Context, provider content.Provider, pusher Pusher, desc ocispec.Descriptor) error {
 	log.G(ctx).Debug("push")
 
-	cw, err := pusher.Push(ctx, desc)
+	var (
+		cw  content.Writer
+		err error
+	)
+	if cs, ok := pusher.(content.Ingester); ok {
+		cw, err = content.OpenWriter(ctx, cs, content.WithRef(MakeRefKey(ctx, desc)), content.WithDescriptor(desc))
+	} else {
+		cw, err = pusher.Push(ctx, desc)
+	}
 	if err != nil {
 		if !errdefs.IsAlreadyExists(err) {
 			return err
@@ -157,7 +197,8 @@ func push(ctx context.Context, provider content.Provider, pusher Pusher, desc oc
 //
 // Base handlers can be provided which will be called before any push specific
 // handlers.
-func PushContent(ctx context.Context, pusher Pusher, desc ocispec.Descriptor, store content.Store, platform platforms.MatchComparer, wrapper func(h images.Handler) images.Handler) error {
+func PushContent(ctx context.Context, pusher Pusher, desc ocispec.Descriptor, store content.Store, limiter *semaphore.Weighted, platform platforms.MatchComparer, wrapper func(h images.Handler) images.Handler) error {
+
 	var m sync.Mutex
 	manifestStack := []ocispec.Descriptor{}
 
@@ -189,7 +230,7 @@ func PushContent(ctx context.Context, pusher Pusher, desc ocispec.Descriptor, st
 		handler = wrapper(handler)
 	}
 
-	if err := images.Dispatch(ctx, handler, nil, desc); err != nil {
+	if err := images.Dispatch(ctx, handler, limiter, desc); err != nil {
 		return err
 	}
 

@@ -42,7 +42,17 @@ type resourceListDifference struct {
 }
 
 func (l resourceListDifference) HasDiff() bool {
-	return len(l.Additions) > 0 || len(l.Deletions) > 0 || len(l.Updates) > 0
+	if len(l.Deletions) > 0 || len(l.Updates) > 0 || (len(metadataFiles) == 0 && len(l.Additions) > 0) {
+		return true
+	}
+
+	for _, add := range l.Additions {
+		if ok := metadataFiles[add.Path()]; !ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (l resourceListDifference) String() string {
@@ -56,7 +66,7 @@ func (l resourceListDifference) String() string {
 	for _, upt := range l.Updates {
 		fmt.Fprintf(buf, "~ %s\n", upt.String())
 	}
-	return string(buf.Bytes())
+	return buf.String()
 }
 
 // diffManifest compares two resource lists and returns the list

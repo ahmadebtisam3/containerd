@@ -17,13 +17,19 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 
-	"github.com/BurntSushi/toml"
+	"github.com/imdario/mergo"
+	"github.com/pelletier/go-toml"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/plugin"
-	"github.com/pkg/errors"
 )
+
+// NOTE: Any new map fields added also need to be handled in mergeConfig.
 
 // Config provides containerd configuration data for the server
 type Config struct {
@@ -37,6 +43,8 @@ type Config struct {
 	PluginDir string `toml:"plugin_dir"`
 	// GRPC configuration settings
 	GRPC GRPCConfig `toml:"grpc"`
+	// TTRPC configuration settings
+	TTRPC TTRPCConfig `toml:"ttrpc"`
 	// Debug and profiling settings
 	Debug Debug `toml:"debug"`
 	// Metrics and monitoring settings
@@ -48,23 +56,23 @@ type Config struct {
 	// required plugin doesn't exist or fails to be initialized or started.
 	RequiredPlugins []string `toml:"required_plugins"`
 	// Plugins provides plugin specific configuration for the initialization of a plugin
-	Plugins map[string]toml.Primitive `toml:"plugins"`
+	Plugins map[string]toml.Tree `toml:"plugins"`
 	// OOMScore adjust the containerd's oom score
 	OOMScore int `toml:"oom_score"`
 	// Cgroup specifies cgroup information for the containerd daemon process
 	Cgroup CgroupConfig `toml:"cgroup"`
 	// ProxyPlugins configures plugins which are communicated to over GRPC
 	ProxyPlugins map[string]ProxyPlugin `toml:"proxy_plugins"`
+	// Timeouts specified as a duration
+	Timeouts map[string]string `toml:"timeouts"`
+	// Imports are additional file path list to config files that can overwrite main config file fields
+	Imports []string `toml:"imports"`
 
-	StreamProcessors []StreamProcessor `toml:"stream_processors"`
-
-	md toml.MetaData
+	StreamProcessors map[string]StreamProcessor `toml:"stream_processors"`
 }
 
 // StreamProcessor provides configuration for diff content processors
 type StreamProcessor struct {
-	// ID of the processor, also used to fetch the specific payload
-	ID string `toml:"id"`
 	// Accepts specific media-types
 	Accepts []string `toml:"accepts"`
 	// Returns the media-type
@@ -73,6 +81,8 @@ type StreamProcessor struct {
 	Path string `toml:"path"`
 	// Args to the binary
 	Args []string `toml:"args"`
+	// Environment variables for the binary
+	Env []string `toml:"env"`
 }
 
 // GetVersion returns the config file's version
@@ -85,7 +95,10 @@ func (c *Config) GetVersion() int {
 
 // ValidateV2 validates the config for a v2 file
 func (c *Config) ValidateV2() error {
-	if c.GetVersion() != 2 {
+	version := c.GetVersion()
+	if version < 2 {
+		logrus.Warnf("containerd config version `%d` has been deprecated and will be removed in containerd v2.0, please switch to version `2`, "+
+			"see https://github.com/containerd/containerd/blob/main/docs/PLUGINS.md#version-header", version)
 		return nil
 	}
 	for _, p := range c.DisabledPlugins {
@@ -103,11 +116,6 @@ func (c *Config) ValidateV2() error {
 			return errors.Errorf("invalid plugin key URI %q expect io.containerd.x.vx", p)
 		}
 	}
-	for p := range c.ProxyPlugins {
-		if len(strings.Split(p, ".")) < 4 {
-			return errors.Errorf("invalid proxy plugin key URI %q expect io.containerd.x.vx", p)
-		}
-	}
 	return nil
 }
 
@@ -123,12 +131,21 @@ type GRPCConfig struct {
 	MaxSendMsgSize int    `toml:"max_send_message_size"`
 }
 
+// TTRPCConfig provides TTRPC configuration for the socket
+type TTRPCConfig struct {
+	Address string `toml:"address"`
+	UID     int    `toml:"uid"`
+	GID     int    `toml:"gid"`
+}
+
 // Debug provides debug configuration
 type Debug struct {
 	Address string `toml:"address"`
 	UID     int    `toml:"uid"`
 	GID     int    `toml:"gid"`
 	Level   string `toml:"level"`
+	// Format represents the logging format
+	Format string `toml:"format"`
 }
 
 // MetricsConfig provides metrics configuration
@@ -196,23 +213,139 @@ func (c *Config) Decode(p *plugin.Registration) (interface{}, error) {
 	if !ok {
 		return p.Config, nil
 	}
-	if err := c.md.PrimitiveDecode(data, p.Config); err != nil {
+	if err := data.Unmarshal(p.Config); err != nil {
 		return nil, err
 	}
 	return p.Config, nil
 }
 
 // LoadConfig loads the containerd server config from the provided path
-func LoadConfig(path string, v *Config) error {
-	if v == nil {
-		return errors.Wrapf(errdefs.ErrInvalidArgument, "argument v must not be nil")
+func LoadConfig(path string, out *Config) error {
+	if out == nil {
+		return errors.Wrapf(errdefs.ErrInvalidArgument, "argument out must not be nil")
 	}
-	md, err := toml.DecodeFile(path, v)
+
+	var (
+		loaded  = map[string]bool{}
+		pending = []string{path}
+	)
+
+	for len(pending) > 0 {
+		path, pending = pending[0], pending[1:]
+
+		// Check if a file at the given path already loaded to prevent circular imports
+		if _, ok := loaded[path]; ok {
+			continue
+		}
+
+		config, err := loadConfigFile(path)
+		if err != nil {
+			return err
+		}
+
+		if err := mergeConfig(out, config); err != nil {
+			return err
+		}
+
+		imports, err := resolveImports(path, config.Imports)
+		if err != nil {
+			return err
+		}
+
+		loaded[path] = true
+		pending = append(pending, imports...)
+	}
+
+	// Fix up the list of config files loaded
+	out.Imports = []string{}
+	for path := range loaded {
+		out.Imports = append(out.Imports, path)
+	}
+
+	err := out.ValidateV2()
+	if err != nil {
+		return errors.Wrapf(err, "failed to load TOML from %s", path)
+	}
+	return nil
+}
+
+// loadConfigFile decodes a TOML file at the given path
+func loadConfigFile(path string) (*Config, error) {
+	config := &Config{}
+
+	file, err := toml.LoadFile(path)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load TOML: %s", path)
+	}
+
+	if err := file.Unmarshal(config); err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal TOML")
+	}
+
+	return config, nil
+}
+
+// resolveImports resolves import strings list to absolute paths list:
+// - If path contains *, glob pattern matching applied
+// - Non abs path is relative to parent config file directory
+// - Abs paths returned as is
+func resolveImports(parent string, imports []string) ([]string, error) {
+	var out []string
+
+	for _, path := range imports {
+		if strings.Contains(path, "*") {
+			matches, err := filepath.Glob(path)
+			if err != nil {
+				return nil, err
+			}
+
+			out = append(out, matches...)
+		} else {
+			path = filepath.Clean(path)
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(filepath.Dir(parent), path)
+			}
+
+			out = append(out, path)
+		}
+	}
+
+	return out, nil
+}
+
+// mergeConfig merges Config structs with the following rules:
+// 'to'         'from'      'result'
+// ""           "value"     "value"
+// "value"      ""          "value"
+// 1            0           1
+// 0            1           1
+// []{"1"}      []{"2"}     []{"1","2"}
+// []{"1"}      []{}        []{"1"}
+// Maps merged by keys, but values are replaced entirely.
+func mergeConfig(to, from *Config) error {
+	err := mergo.Merge(to, from, mergo.WithOverride, mergo.WithAppendSlice)
 	if err != nil {
 		return err
 	}
-	v.md = md
-	return v.ValidateV2()
+
+	// Replace entire sections instead of merging map's values.
+	for k, v := range from.Plugins {
+		to.Plugins[k] = v
+	}
+
+	for k, v := range from.StreamProcessors {
+		to.StreamProcessors[k] = v
+	}
+
+	for k, v := range from.ProxyPlugins {
+		to.ProxyPlugins[k] = v
+	}
+
+	for k, v := range from.Timeouts {
+		to.Timeouts[k] = v
+	}
+
+	return nil
 }
 
 // V1DisabledFilter matches based on ID

@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -31,10 +32,9 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/testutil"
 	"github.com/containerd/containerd/snapshots/devmapper/dmsetup"
-	"github.com/containerd/containerd/snapshots/devmapper/losetup"
 	"github.com/docker/go-units"
 	"github.com/sirupsen/logrus"
-	"gotest.tools/assert"
+	"gotest.tools/v3/assert"
 )
 
 const (
@@ -74,7 +74,7 @@ func TestPoolDevice(t *testing.T) {
 
 	defer func() {
 		// Detach loop devices and remove images
-		err := losetup.DetachLoopDevice(loopDataDevice, loopMetaDevice)
+		err := mount.DetachLoopDevice(loopDataDevice, loopMetaDevice)
 		assert.NilError(t, err)
 
 		err = os.RemoveAll(tempDir)
@@ -152,6 +152,27 @@ func TestPoolDevice(t *testing.T) {
 	t.Run("RemoveDevice", func(t *testing.T) {
 		testRemoveThinDevice(t, pool)
 	})
+
+	t.Run("rollbackActivate", func(t *testing.T) {
+		testCreateThinDevice(t, pool)
+
+		ctx := context.Background()
+
+		snapDevice := "snap2"
+
+		err := pool.CreateSnapshotDevice(ctx, thinDevice1, snapDevice, device1Size)
+		assert.NilError(t, err)
+
+		info, err := pool.metadata.GetDevice(ctx, snapDevice)
+		assert.NilError(t, err)
+
+		// Simulate a case that the device cannot be activated.
+		err = pool.DeactivateDevice(ctx, info.Name, false, false)
+		assert.NilError(t, err)
+
+		err = pool.rollbackActivate(ctx, info, err)
+		assert.NilError(t, err)
+	})
 }
 
 func TestPoolDeviceMarkFaulty(t *testing.T) {
@@ -161,7 +182,9 @@ func TestPoolDeviceMarkFaulty(t *testing.T) {
 	err := store.AddDevice(testCtx, &DeviceInfo{Name: "1", State: Unknown})
 	assert.NilError(t, err)
 
-	err = store.AddDevice(testCtx, &DeviceInfo{Name: "2", State: Activated})
+	// Note: do not use 'Activated' here because pool.ensureDeviceStates() will
+	// try to activate the real dm device, which will fail on a faked device.
+	err = store.AddDevice(testCtx, &DeviceInfo{Name: "2", State: Deactivated})
 	assert.NilError(t, err)
 
 	pool := &PoolDevice{metadata: store}
@@ -177,7 +200,7 @@ func TestPoolDeviceMarkFaulty(t *testing.T) {
 			assert.Equal(t, Faulty, info.State)
 			assert.Equal(t, "1", info.Name)
 		case 2:
-			assert.Equal(t, Activated, info.State)
+			assert.Equal(t, Deactivated, info.State)
 			assert.Equal(t, "2", info.Name)
 		default:
 			t.Error("unexpected walk call")
@@ -254,6 +277,9 @@ func testDeactivateThinDevice(t *testing.T, pool *PoolDevice) {
 func testRemoveThinDevice(t *testing.T, pool *PoolDevice) {
 	err := pool.RemoveDevice(testCtx, thinDevice1)
 	assert.NilError(t, err, "should delete thin device from pool")
+
+	err = pool.RemoveDevice(testCtx, thinDevice2)
+	assert.NilError(t, err, "should delete thin device from pool")
 }
 
 func getMounts(thinDeviceName string) []mount.Mount {
@@ -280,7 +306,7 @@ func createLoopbackDevice(t *testing.T, dir string) (string, string) {
 
 	imagePath := file.Name()
 
-	loopDevice, err := losetup.AttachLoopDevice(imagePath)
+	loopDevice, err := mount.AttachLoopDevice(imagePath)
 	assert.NilError(t, err)
 
 	return imagePath, loopDevice

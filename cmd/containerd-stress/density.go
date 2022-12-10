@@ -31,7 +31,6 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	"github.com/sirupsen/logrus"
@@ -56,6 +55,7 @@ var densityCommand = cli.Command{
 			Exec:        cliContext.GlobalBool("exec"),
 			JSON:        cliContext.GlobalBool("json"),
 			Metrics:     cliContext.GlobalString("metrics"),
+			Snapshotter: cliContext.GlobalString("snapshotter"),
 		}
 		client, err := config.newClient()
 		if err != nil {
@@ -67,7 +67,7 @@ var densityCommand = cli.Command{
 			return err
 		}
 		logrus.Infof("pulling %s", imageName)
-		image, err := client.Pull(ctx, imageName, containerd.WithPullUnpack)
+		image, err := client.Pull(ctx, imageName, containerd.WithPullUnpack, containerd.WithPullSnapshotter(config.Snapshotter))
 		if err != nil {
 			return err
 		}
@@ -76,11 +76,6 @@ var densityCommand = cli.Command{
 		s := make(chan os.Signal, 1)
 		signal.Notify(s, syscall.SIGTERM, syscall.SIGINT)
 
-		spec, err := oci.GenerateSpec(ctx, client,
-			&containers.Container{},
-			oci.WithImageConfig(image),
-			oci.WithProcessArgs("sleep", "120m"),
-		)
 		if err != nil {
 			return err
 		}
@@ -95,11 +90,14 @@ var densityCommand = cli.Command{
 				break loop
 			default:
 				id := fmt.Sprintf("density-%d", i)
-				spec.Linux.CgroupsPath = filepath.Join("/", "density", id)
 
 				c, err := client.NewContainer(ctx, id,
+					containerd.WithSnapshotter(config.Snapshotter),
 					containerd.WithNewSnapshot(id, image),
-					containerd.WithSpec(spec, oci.WithUsername("games")),
+					containerd.WithNewSpec(
+						oci.WithImageConfig(image),
+						oci.WithProcessArgs("sleep", "120m"),
+						oci.WithUsername("games")),
 				)
 				if err != nil {
 					return err

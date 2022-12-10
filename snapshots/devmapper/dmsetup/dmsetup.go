@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -20,6 +21,8 @@ package dmsetup
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -272,10 +275,11 @@ func Version() (string, error) {
 
 // DeviceStatus represents devmapper device status information
 type DeviceStatus struct {
-	Offset int64
-	Length int64
-	Target string
-	Params []string
+	RawOutput string
+	Offset    int64
+	Length    int64
+	Target    string
+	Params    []string
 }
 
 // Status provides status information for devmapper device
@@ -289,6 +293,7 @@ func Status(deviceName string) (*DeviceStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	status.RawOutput = output
 
 	// Status output format:
 	//  Offset (int64)
@@ -327,15 +332,18 @@ func GetFullDevicePath(deviceName string) string {
 }
 
 // BlockDeviceSize returns size of block device in bytes
-func BlockDeviceSize(devicePath string) (uint64, error) {
-	data, err := exec.Command("blockdev", "--getsize64", "-q", devicePath).CombinedOutput()
-	output := string(data)
+func BlockDeviceSize(path string) (int64, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return 0, errors.Wrapf(err, output)
+		return 0, err
 	}
+	defer f.Close()
 
-	output = strings.TrimSuffix(output, "\n")
-	return strconv.ParseUint(output, 10, 64)
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to seek on %q", path)
+	}
+	return size, nil
 }
 
 func dmsetup(args ...string) (string, error) {
@@ -347,7 +355,7 @@ func dmsetup(args ...string) (string, error) {
 			return "", errno
 		}
 
-		return "", errors.Wrapf(err, "dmsetup %s\nerror: %s\n", strings.Join(args, " "), output)
+		return "", errors.Wrapf(err, "dmsetup %s, error: %s", strings.Join(args, " "), output)
 	}
 
 	output = strings.TrimSuffix(output, "\n")

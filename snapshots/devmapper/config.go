@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -22,9 +23,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/BurntSushi/toml"
 	"github.com/docker/go-units"
 	"github.com/hashicorp/go-multierror"
+	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 )
 
@@ -40,6 +41,9 @@ type Config struct {
 	// Defines how much space to allocate when creating base image for container
 	BaseImageSize      string `toml:"base_image_size"`
 	BaseImageSizeBytes uint64 `toml:"-"`
+
+	// Flag to async remove device using Cleanup() callback in snapshots GC
+	AsyncRemove bool `toml:"async_remove"`
 }
 
 // LoadConfig reads devmapper configuration file from disk in TOML format
@@ -53,8 +57,13 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	config := Config{}
-	if _, err := toml.DecodeFile(path, &config); err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal data at '%s'", path)
+	file, err := toml.LoadFile(path)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to open devmapepr TOML: %s", path)
+	}
+
+	if err := file.Unmarshal(&config); err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal devmapper TOML")
 	}
 
 	if err := config.parse(); err != nil {

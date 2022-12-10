@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -24,7 +25,7 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/mount"
-	"gotest.tools/assert"
+	"gotest.tools/v3/assert"
 )
 
 // Unmount unmounts a given mountPoint and sets t.Error if it fails

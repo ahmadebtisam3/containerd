@@ -1,3 +1,4 @@
+//go:build linux || darwin || freebsd || solaris
 // +build linux darwin freebsd solaris
 
 /*
@@ -21,13 +22,12 @@ package command
 import (
 	"context"
 	"os"
+	"path/filepath"
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/services/server"
 	"golang.org/x/sys/unix"
 )
-
-const defaultConfigPath = "/etc/containerd/config.toml"
 
 var handledSignals = []os.Signal{
 	unix.SIGTERM,
@@ -45,22 +45,36 @@ func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *se
 			case s := <-serverC:
 				server = s
 			case s := <-signals:
+
+				// Do not print message when deailing with SIGPIPE, which may cause
+				// nested signals and consume lots of cpu bandwidth.
+				if s == unix.SIGPIPE {
+					continue
+				}
+
 				log.G(ctx).WithField("signal", s).Debug("received signal")
 				switch s {
 				case unix.SIGUSR1:
 					dumpStacks(true)
-				case unix.SIGPIPE:
-					continue
 				default:
+					if err := notifyStopping(ctx); err != nil {
+						log.G(ctx).WithError(err).Error("notify stopping failed")
+					}
+
 					if server == nil {
 						close(done)
 						return
 					}
 					server.Stop()
 					close(done)
+					return
 				}
 			}
 		}
 	}()
 	return done
+}
+
+func isLocalAddress(path string) bool {
+	return filepath.IsAbs(path)
 }

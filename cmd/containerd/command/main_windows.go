@@ -20,10 +20,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strings"
 	"unsafe"
 
-	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/etw"
 	"github.com/Microsoft/go-winio/pkg/etwlogrus"
 	"github.com/Microsoft/go-winio/pkg/guid"
@@ -34,8 +33,7 @@ import (
 )
 
 var (
-	defaultConfigPath = filepath.Join(os.Getenv("programfiles"), "containerd", "config.toml")
-	handledSignals    = []os.Signal{
+	handledSignals = []os.Signal{
 		windows.SIGTERM,
 		windows.SIGINT,
 	}
@@ -51,6 +49,11 @@ func handleSignals(ctx context.Context, signals chan os.Signal, serverC chan *se
 				server = s
 			case s := <-signals:
 				log.G(ctx).WithField("signal", s).Debug("received signal")
+
+				if err := notifyStopping(ctx); err != nil {
+					log.G(ctx).WithError(err).Error("notify stopping failed")
+				}
+
 				if server == nil {
 					close(done)
 					return
@@ -70,7 +73,7 @@ func setupDumpStacks() {
 	// signaled. ACL'd to builtin administrators and local system
 	event := "Global\\stackdump-" + fmt.Sprint(os.Getpid())
 	ev, _ := windows.UTF16PtrFromString(event)
-	sd, err := winio.SddlToSecurityDescriptor("D:P(A;;GA;;;BA)(A;;GA;;;SY)")
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;BA)(A;;GA;;;SY)")
 	if err != nil {
 		logrus.Errorf("failed to get security descriptor for debug stackdump event %s: %s", event, err.Error())
 		return
@@ -78,7 +81,7 @@ func setupDumpStacks() {
 	var sa windows.SecurityAttributes
 	sa.Length = uint32(unsafe.Sizeof(sa))
 	sa.InheritHandle = 1
-	sa.SecurityDescriptor = uintptr(unsafe.Pointer(&sd[0]))
+	sa.SecurityDescriptor = sd
 	h, err := windows.CreateEvent(&sa, 0, 0, ev)
 	if h == 0 || err != nil {
 		logrus.Errorf("failed to create debug stackdump event %s: %s", event, err.Error())
@@ -114,4 +117,8 @@ func init() {
 			logrus.Error(err)
 		}
 	}
+}
+
+func isLocalAddress(path string) bool {
+	return strings.HasPrefix(path, `\\.\pipe\`)
 }

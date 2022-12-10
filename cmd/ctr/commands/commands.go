@@ -61,6 +61,31 @@ var (
 			Name:  "refresh",
 			Usage: "refresh token for authorization server",
 		},
+		cli.StringFlag{
+			Name: "hosts-dir",
+			// compatible with "/etc/docker/certs.d"
+			Usage: "Custom hosts configuration directory",
+		},
+		cli.StringFlag{
+			Name:  "tlscacert",
+			Usage: "path to TLS root CA",
+		},
+		cli.StringFlag{
+			Name:  "tlscert",
+			Usage: "path to TLS client certificate",
+		},
+		cli.StringFlag{
+			Name:  "tlskey",
+			Usage: "path to TLS client key",
+		},
+		cli.BoolFlag{
+			Name:  "http-dump",
+			Usage: "dump all HTTP request/responses when interacting with container registry",
+		},
+		cli.BoolFlag{
+			Name:  "http-trace",
+			Usage: "enable HTTP tracing for registry interactions",
+		},
 	}
 
 	// ContainerFlags are cli flags specifying container options
@@ -75,15 +100,19 @@ var (
 		},
 		cli.StringSliceFlag{
 			Name:  "env",
-			Usage: "specify additional container environment variables (i.e. FOO=bar)",
+			Usage: "specify additional container environment variables (e.g. FOO=bar)",
+		},
+		cli.StringFlag{
+			Name:  "env-file",
+			Usage: "specify additional container environment variables in a file(e.g. FOO=bar, one per line)",
 		},
 		cli.StringSliceFlag{
 			Name:  "label",
-			Usage: "specify additional labels (i.e. foo=bar)",
+			Usage: "specify additional labels (e.g. foo=bar)",
 		},
 		cli.StringSliceFlag{
 			Name:  "mount",
-			Usage: "specify additional container mount (ex: type=bind,src=/tmp,dst=/host,options=rbind:ro)",
+			Usage: "specify additional container mount (e.g. type=bind,src=/tmp,dst=/host,options=rbind:ro)",
 		},
 		cli.BoolFlag{
 			Name:  "net-host",
@@ -101,6 +130,10 @@ var (
 			Name:  "runtime",
 			Usage: "runtime name",
 			Value: defaults.DefaultRuntime,
+		},
+		cli.StringFlag{
+			Name:  "runtime-config-path",
+			Usage: "optional runtime config path",
 		},
 		cli.BoolFlag{
 			Name:  "tty,t",
@@ -128,23 +161,23 @@ var (
 		},
 		cli.StringSliceFlag{
 			Name:  "device",
-			Usage: "add a device to a container",
+			Usage: "file path to a device to add to the container; or a path to a directory tree of devices to add to the container",
 		},
-	}
-	// ImageDecryptionFlags are cli flags needed when decrypting an image
-	ImageDecryptionFlags = []cli.Flag{
+		cli.BoolFlag{
+			Name:  "seccomp",
+			Usage: "enable the default seccomp profile",
+		},
 		cli.StringFlag{
-			Name:  "gpg-homedir",
-			Usage: "The GPG homedir to use; by default gpg uses ~/.gnupg",
-		}, cli.StringFlag{
-			Name:  "gpg-version",
-			Usage: "The GPG version (\"v1\" or \"v2\"), default will make an educated guess",
-		}, cli.StringSliceFlag{
-			Name:  "key",
-			Usage: "A secret key's filename and an optional password separated by colon; this option may be provided multiple times",
-		}, cli.StringSliceFlag{
-			Name:  "dec-recipient",
-			Usage: "Recipient of the image; used only for PKCS7 and must be an x509 certificate",
+			Name:  "seccomp-profile",
+			Usage: "file path to custom seccomp profile. seccomp must be set to true, before using seccomp-profile",
+		},
+		cli.StringFlag{
+			Name:  "apparmor-default-profile",
+			Usage: "enable AppArmor with the default profile with the specified name, e.g. \"cri-containerd.apparmor.d\"",
+		},
+		cli.StringFlag{
+			Name:  "apparmor-profile",
+			Usage: "enable AppArmor with an existing custom profile",
 		},
 	}
 )

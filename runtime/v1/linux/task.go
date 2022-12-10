@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -91,9 +92,12 @@ func (t *Task) PID() uint32 {
 
 // Delete the task and return the exit status
 func (t *Task) Delete(ctx context.Context) (*runtime.Exit, error) {
-	rsp, err := t.shim.Delete(ctx, empty)
-	if err != nil && !errdefs.IsNotFound(err) {
-		return nil, errdefs.FromGRPC(err)
+	rsp, shimErr := t.shim.Delete(ctx, empty)
+	if shimErr != nil {
+		shimErr = errdefs.FromGRPC(shimErr)
+		if !errdefs.IsNotFound(shimErr) {
+			return nil, shimErr
+		}
 	}
 	t.tasks.Delete(ctx, t.id)
 	if err := t.shim.KillShim(ctx); err != nil {
@@ -101,6 +105,9 @@ func (t *Task) Delete(ctx context.Context) (*runtime.Exit, error) {
 	}
 	if err := t.bundle.Delete(); err != nil {
 		log.G(ctx).WithError(err).Error("failed to delete bundle")
+	}
+	if shimErr != nil {
+		return nil, shimErr
 	}
 	t.events.Publish(ctx, runtime.TaskDeleteEventTopic, &eventstypes.TaskDelete{
 		ContainerID: t.id,
@@ -153,7 +160,7 @@ func (t *Task) State(ctx context.Context) (runtime.State, error) {
 		ID: t.id,
 	})
 	if err != nil {
-		if errors.Cause(err) != ttrpc.ErrClosed {
+		if !errors.Is(err, ttrpc.ErrClosed) {
 			return runtime.State{}, errdefs.FromGRPC(err)
 		}
 		return runtime.State{}, errdefs.ErrNotFound
@@ -300,7 +307,7 @@ func (t *Task) Checkpoint(ctx context.Context, path string, options *types.Any) 
 }
 
 // Update changes runtime information of a running task
-func (t *Task) Update(ctx context.Context, resources *types.Any) error {
+func (t *Task) Update(ctx context.Context, resources *types.Any, _ map[string]string) error {
 	if _, err := t.shim.Update(ctx, &shim.UpdateTaskRequest{
 		Resources: resources,
 	}); err != nil {

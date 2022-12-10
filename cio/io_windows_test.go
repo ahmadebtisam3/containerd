@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 /*
@@ -21,7 +22,7 @@ package cio
 import (
 	"testing"
 
-	"gotest.tools/assert"
+	"gotest.tools/v3/assert"
 )
 
 func TestNewFifoSetInDir_NoTerminal(t *testing.T) {

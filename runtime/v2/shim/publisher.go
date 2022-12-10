@@ -41,13 +41,14 @@ type item struct {
 	count int
 }
 
-func newPublisher(address string) (*remoteEventsPublisher, error) {
+// NewPublisher creates a new remote events publisher
+func NewPublisher(address string) (*RemoteEventsPublisher, error) {
 	client, err := ttrpcutil.NewClient(address)
 	if err != nil {
 		return nil, err
 	}
 
-	l := &remoteEventsPublisher{
+	l := &RemoteEventsPublisher{
 		client:  client,
 		closed:  make(chan struct{}),
 		requeue: make(chan *item, queueSize),
@@ -57,18 +58,21 @@ func newPublisher(address string) (*remoteEventsPublisher, error) {
 	return l, nil
 }
 
-type remoteEventsPublisher struct {
+// RemoteEventsPublisher forwards events to a ttrpc server
+type RemoteEventsPublisher struct {
 	client  *ttrpcutil.Client
 	closed  chan struct{}
 	closer  sync.Once
 	requeue chan *item
 }
 
-func (l *remoteEventsPublisher) Done() <-chan struct{} {
+// Done returns a channel which closes when done
+func (l *RemoteEventsPublisher) Done() <-chan struct{} {
 	return l.closed
 }
 
-func (l *remoteEventsPublisher) Close() (err error) {
+// Close closes the remote connection and closes the done channel
+func (l *RemoteEventsPublisher) Close() (err error) {
 	err = l.client.Close()
 	l.closer.Do(func() {
 		close(l.closed)
@@ -76,7 +80,7 @@ func (l *remoteEventsPublisher) Close() (err error) {
 	return err
 }
 
-func (l *remoteEventsPublisher) processQueue() {
+func (l *RemoteEventsPublisher) processQueue() {
 	for i := range l.requeue {
 		if i.count > maxRequeue {
 			logrus.Errorf("evicting %s from queue because of retry count", i.ev.Topic)
@@ -91,7 +95,7 @@ func (l *remoteEventsPublisher) processQueue() {
 	}
 }
 
-func (l *remoteEventsPublisher) queue(i *item) {
+func (l *RemoteEventsPublisher) queue(i *item) {
 	go func() {
 		i.count++
 		// re-queue after a short delay
@@ -100,7 +104,8 @@ func (l *remoteEventsPublisher) queue(i *item) {
 	}()
 }
 
-func (l *remoteEventsPublisher) Publish(ctx context.Context, topic string, event events.Event) error {
+// Publish publishes the event by forwarding it to the configured ttrpc server
+func (l *RemoteEventsPublisher) Publish(ctx context.Context, topic string, event events.Event) error {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return err
@@ -127,10 +132,15 @@ func (l *remoteEventsPublisher) Publish(ctx context.Context, topic string, event
 	return nil
 }
 
-func (l *remoteEventsPublisher) forwardRequest(ctx context.Context, req *v1.ForwardRequest) error {
-	_, err := l.client.EventsService().Forward(ctx, req)
+func (l *RemoteEventsPublisher) forwardRequest(ctx context.Context, req *v1.ForwardRequest) error {
+	service, err := l.client.EventsService()
 	if err == nil {
-		return nil
+		fCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err = service.Forward(fCtx, req)
+		cancel()
+		if err == nil {
+			return nil
+		}
 	}
 
 	if err != ttrpc.ErrClosed {
@@ -138,11 +148,20 @@ func (l *remoteEventsPublisher) forwardRequest(ctx context.Context, req *v1.Forw
 	}
 
 	// Reconnect and retry request
-	if err := l.client.Reconnect(); err != nil {
+	if err = l.client.Reconnect(); err != nil {
 		return err
 	}
 
-	if _, err := l.client.EventsService().Forward(ctx, req); err != nil {
+	service, err = l.client.EventsService()
+	if err != nil {
+		return err
+	}
+
+	// try again with a fresh context, otherwise we may get a context timeout unexpectedly.
+	fCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_, err = service.Forward(fCtx, req)
+	cancel()
+	if err != nil {
 		return err
 	}
 

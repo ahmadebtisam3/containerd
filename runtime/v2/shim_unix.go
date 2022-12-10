@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -21,12 +22,27 @@ package v2
 import (
 	"context"
 	"io"
+	"net"
+	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/containerd/fifo"
+	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
 
-func openShimLog(ctx context.Context, bundle *Bundle) (io.ReadCloser, error) {
-	return fifo.OpenFifo(ctx, filepath.Join(bundle.Path, "log"), unix.O_RDONLY|unix.O_CREAT|unix.O_NONBLOCK, 0700)
+func openShimLog(ctx context.Context, bundle *Bundle, _ func(string, time.Duration) (net.Conn, error)) (io.ReadCloser, error) {
+	return fifo.OpenFifo(ctx, filepath.Join(bundle.Path, "log"), unix.O_RDWR|unix.O_CREAT|unix.O_NONBLOCK, 0700)
+}
+
+func checkCopyShimLogError(ctx context.Context, err error) error {
+	select {
+	case <-ctx.Done():
+		if err == fifo.ErrReadClosed || errors.Is(err, os.ErrClosed) {
+			return nil
+		}
+	default:
+	}
+	return err
 }

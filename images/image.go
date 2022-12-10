@@ -19,8 +19,8 @@ package images
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/containerd/containerd/content"
@@ -155,6 +155,10 @@ func Manifest(ctx context.Context, provider content.Provider, image ocispec.Desc
 				return nil, err
 			}
 
+			if err := validateMediaType(p, desc.MediaType); err != nil {
+				return nil, errors.Wrapf(err, "manifest: invalid desc %s", desc.Digest)
+			}
+
 			var manifest ocispec.Manifest
 			if err := json.Unmarshal(p, &manifest); err != nil {
 				return nil, err
@@ -193,6 +197,10 @@ func Manifest(ctx context.Context, provider content.Provider, image ocispec.Desc
 			p, err := content.ReadBlob(ctx, provider, desc)
 			if err != nil {
 				return nil, err
+			}
+
+			if err := validateMediaType(p, desc.MediaType); err != nil {
+				return nil, errors.Wrapf(err, "manifest: invalid desc %s", desc.Digest)
 			}
 
 			var idx ocispec.Index
@@ -290,7 +298,7 @@ func Platforms(ctx context.Context, provider content.Provider, image ocispec.Des
 // If available is true, the caller can assume that required represents the
 // complete set of content required for the image.
 //
-// missing will have the components that are part of required but not avaiiable
+// missing will have the components that are part of required but not available
 // in the provider.
 //
 // If there is a problem resolving content, an error will be returned.
@@ -337,6 +345,10 @@ func Children(ctx context.Context, provider content.Provider, desc ocispec.Descr
 			return nil, err
 		}
 
+		if err := validateMediaType(p, desc.MediaType); err != nil {
+			return nil, errors.Wrapf(err, "children: invalid desc %s", desc.Digest)
+		}
+
 		// TODO(stevvooe): We just assume oci manifest, for now. There may be
 		// subtle differences from the docker version.
 		var manifest ocispec.Manifest
@@ -352,26 +364,63 @@ func Children(ctx context.Context, provider content.Provider, desc ocispec.Descr
 			return nil, err
 		}
 
+		if err := validateMediaType(p, desc.MediaType); err != nil {
+			return nil, errors.Wrapf(err, "children: invalid desc %s", desc.Digest)
+		}
+
 		var index ocispec.Index
 		if err := json.Unmarshal(p, &index); err != nil {
 			return nil, err
 		}
 
 		descs = append(descs, index.Manifests...)
-	case MediaTypeDockerSchema2Layer, MediaTypeDockerSchema2LayerGzip,
-		MediaTypeDockerSchema2LayerEnc, MediaTypeDockerSchema2LayerGzipEnc,
-		MediaTypeDockerSchema2LayerForeign, MediaTypeDockerSchema2LayerForeignGzip,
-		MediaTypeDockerSchema2Config, ocispec.MediaTypeImageConfig,
-		ocispec.MediaTypeImageLayer, ocispec.MediaTypeImageLayerGzip,
-		ocispec.MediaTypeImageLayerNonDistributable, ocispec.MediaTypeImageLayerNonDistributableGzip,
-		MediaTypeContainerd1Checkpoint, MediaTypeContainerd1CheckpointConfig:
-		// childless data types.
-		return nil, nil
 	default:
-		log.G(ctx).Warnf("encountered unknown type %v; children may not be fetched", desc.MediaType)
+		if IsLayerType(desc.MediaType) || IsKnownConfig(desc.MediaType) {
+			// childless data types.
+			return nil, nil
+		}
+		log.G(ctx).Debugf("encountered unknown type %v; children may not be fetched", desc.MediaType)
 	}
 
 	return descs, nil
+}
+
+// unknownDocument represents a manifest, manifest list, or index that has not
+// yet been validated.
+type unknownDocument struct {
+	MediaType string          `json:"mediaType,omitempty"`
+	Config    json.RawMessage `json:"config,omitempty"`
+	Layers    json.RawMessage `json:"layers,omitempty"`
+	Manifests json.RawMessage `json:"manifests,omitempty"`
+	FSLayers  json.RawMessage `json:"fsLayers,omitempty"` // schema 1
+}
+
+// validateMediaType returns an error if the byte slice is invalid JSON or if
+// the media type identifies the blob as one format but it contains elements of
+// another format.
+func validateMediaType(b []byte, mt string) error {
+	var doc unknownDocument
+	if err := json.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	if len(doc.FSLayers) != 0 {
+		return fmt.Errorf("media-type: schema 1 not supported")
+	}
+	switch mt {
+	case MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
+		if len(doc.Manifests) != 0 ||
+			doc.MediaType == MediaTypeDockerSchema2ManifestList ||
+			doc.MediaType == ocispec.MediaTypeImageIndex {
+			return fmt.Errorf("media-type: expected manifest but found index (%s)", mt)
+		}
+	case MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex:
+		if len(doc.Config) != 0 || len(doc.Layers) != 0 ||
+			doc.MediaType == MediaTypeDockerSchema2Manifest ||
+			doc.MediaType == ocispec.MediaTypeImageManifest {
+			return fmt.Errorf("media-type: expected index but found manifest (%s)", mt)
+		}
+	}
+	return nil
 }
 
 // RootFS returns the unpacked diffids that make up and images rootfs.
@@ -389,73 +438,4 @@ func RootFS(ctx context.Context, provider content.Provider, configDesc ocispec.D
 		return nil, err
 	}
 	return config.RootFS.DiffIDs, nil
-}
-
-// IsCompressedDiff returns true if mediaType is a known compressed diff media type.
-// It returns false if the media type is a diff, but not compressed. If the media type
-// is not a known diff type, it returns errdefs.ErrNotImplemented
-func IsCompressedDiff(ctx context.Context, mediaType string) (bool, error) {
-	switch mediaType {
-	case ocispec.MediaTypeImageLayer, MediaTypeDockerSchema2Layer:
-	case ocispec.MediaTypeImageLayerGzip, MediaTypeDockerSchema2LayerGzip:
-		return true, nil
-	default:
-		// Still apply all generic media types *.tar[.+]gzip and *.tar
-		if strings.HasSuffix(mediaType, ".tar.gzip") || strings.HasSuffix(mediaType, ".tar+gzip") {
-			return true, nil
-		} else if !strings.HasSuffix(mediaType, ".tar") {
-			return false, errdefs.ErrNotImplemented
-		}
-	}
-	return false, nil
-}
-
-// GetImageLayerDescriptors gets the image layer Descriptors of an image; the array contains
-// a list of Descriptors belonging to one platform followed by lists of other platforms
-func GetImageLayerDescriptors(ctx context.Context, cs content.Store, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
-	var lis []ocispec.Descriptor
-
-	ds := platforms.DefaultSpec()
-	platform := &ds
-
-	switch desc.MediaType {
-	case MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex,
-		MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
-		children, err := Children(ctx, cs, desc)
-		if err != nil {
-			if errdefs.IsNotFound(err) {
-				return []ocispec.Descriptor{}, nil
-			}
-			return []ocispec.Descriptor{}, err
-		}
-
-		if desc.Platform != nil {
-			platform = desc.Platform
-		}
-
-		for _, child := range children {
-			var tmp []ocispec.Descriptor
-
-			switch child.MediaType {
-			case MediaTypeDockerSchema2LayerGzip, MediaTypeDockerSchema2Layer,
-				ocispec.MediaTypeImageLayerGzip, ocispec.MediaTypeImageLayer,
-				MediaTypeDockerSchema2LayerGzipEnc, MediaTypeDockerSchema2LayerEnc:
-				tdesc := child
-				tdesc.Platform = platform
-				tmp = append(tmp, tdesc)
-			default:
-				tmp, err = GetImageLayerDescriptors(ctx, cs, child)
-			}
-
-			if err != nil {
-				return []ocispec.Descriptor{}, err
-			}
-
-			lis = append(lis, tmp...)
-		}
-	case MediaTypeDockerSchema2Config, ocispec.MediaTypeImageConfig:
-	default:
-		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "GetImageLayerInfo: unhandled media type %s", desc.MediaType)
-	}
-	return lis, nil
 }

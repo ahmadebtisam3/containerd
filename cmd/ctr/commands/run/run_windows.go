@@ -25,6 +25,7 @@ import (
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
@@ -50,6 +51,7 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 	if config {
 		id = context.Args().First()
 		opts = append(opts, oci.WithSpecFromFile(context.String("config")))
+		cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 	} else {
 		var (
 			ref  = context.Args().First()
@@ -66,6 +68,9 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			opts = append(opts, oci.WithDefaultSpec())
 			opts = append(opts, oci.WithWindowNetworksAllowUnqualifiedDNSQuery())
 			opts = append(opts, oci.WithWindowsIgnoreFlushesDuringBoot())
+		}
+		if ef := context.String("env-file"); ef != "" {
+			opts = append(opts, oci.WithEnvFile(ef))
 		}
 		opts = append(opts, oci.WithEnv(context.StringSlice("env")))
 		opts = append(opts, withMounts(context))
@@ -84,9 +89,13 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			}
 		}
 		opts = append(opts, oci.WithImageConfig(image))
-		cOpts = append(cOpts, containerd.WithImage(image))
-		cOpts = append(cOpts, containerd.WithSnapshotter(snapshotter))
-		cOpts = append(cOpts, containerd.WithNewSnapshot(id, image))
+		labels := buildLabels(commands.LabelArgs(context.StringSlice("label")), image.Labels())
+		cOpts = append(cOpts,
+			containerd.WithImage(image),
+			containerd.WithImageConfigLabels(image),
+			containerd.WithSnapshotter(snapshotter),
+			containerd.WithNewSnapshot(id, image),
+			containerd.WithAdditionalContainerLabels(labels))
 
 		if len(args) > 0 {
 			opts = append(opts, oci.WithProcessArgs(args...))
@@ -104,6 +113,9 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 			}
 			opts = append(opts, oci.WithTTYSize(int(size.Width), int(size.Height)))
 		}
+		if context.Bool("net-host") {
+			return nil, errors.New("Cannot use host mode networking with Windows containers")
+		}
 		if context.Bool("isolated") {
 			opts = append(opts, oci.WithWindowsHyperV)
 		}
@@ -117,7 +129,6 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 		}
 	}
 
-	cOpts = append(cOpts, containerd.WithContainerLabels(commands.LabelArgs(context.StringSlice("label"))))
 	runtime := context.String("runtime")
 	var runtimeOpts interface{}
 	if runtime == "io.containerd.runhcs.v1" {

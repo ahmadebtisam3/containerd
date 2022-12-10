@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -40,6 +41,7 @@ import (
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	shimapi "github.com/containerd/containerd/runtime/v1/shim/v1"
+	"github.com/containerd/containerd/sys/reaper"
 	runc "github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	ptypes "github.com/gogo/protobuf/types"
@@ -54,7 +56,7 @@ var (
 	empty   = &ptypes.Empty{}
 	bufPool = sync.Pool{
 		New: func() interface{} {
-			buffer := make([]byte, 32<<10)
+			buffer := make([]byte, 4096)
 			return &buffer
 		},
 	}
@@ -86,7 +88,7 @@ func NewService(config Config, publisher events.Publisher) (*Service, error) {
 		context:   ctx,
 		processes: make(map[string]process.Process),
 		events:    make(chan interface{}, 128),
-		ec:        Default.Subscribe(),
+		ec:        reaper.Default.Subscribe(),
 	}
 	go s.processExits()
 	if err := s.initPlatform(); err != nil {
@@ -216,7 +218,7 @@ func (s *Service) Delete(ctx context.Context, r *ptypes.Empty) (*shimapi.DeleteR
 		return nil, err
 	}
 	if err := p.Delete(ctx); err != nil {
-		return nil, err
+		return nil, errdefs.ToGRPC(err)
 	}
 	s.mu.Lock()
 	delete(s.processes, s.id)
@@ -239,7 +241,7 @@ func (s *Service) DeleteProcess(ctx context.Context, r *shimapi.DeleteProcessReq
 		return nil, err
 	}
 	if err := p.Delete(ctx); err != nil {
-		return nil, err
+		return nil, errdefs.ToGRPC(err)
 	}
 	s.mu.Lock()
 	delete(s.processes, r.ID)
@@ -396,6 +398,9 @@ func (s *Service) ListPids(ctx context.Context, r *shimapi.ListPidsRequest) (*sh
 		return nil, errdefs.ToGRPC(err)
 	}
 	var processes []*task.ProcessInfo
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, pid := range pids {
 		pInfo := task.ProcessInfo{
 			Pid: pid,
@@ -502,65 +507,59 @@ func (s *Service) processExits() {
 	}
 }
 
-func (s *Service) allProcesses() []process.Process {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	res := make([]process.Process, 0, len(s.processes))
-	for _, p := range s.processes {
-		res = append(res, p)
-	}
-	return res
-}
-
 func (s *Service) checkProcesses(e runc.Exit) {
-	shouldKillAll, err := shouldKillAllOnExit(s.bundle)
-	if err != nil {
-		log.G(s.context).WithError(err).Error("failed to check shouldKillAll")
-	}
-
-	for _, p := range s.allProcesses() {
-		if p.Pid() == e.Pid {
-
-			if shouldKillAll {
-				if ip, ok := p.(*process.Init); ok {
-					// Ensure all children are killed
-					if err := ip.KillAll(s.context); err != nil {
-						log.G(s.context).WithError(err).WithField("id", ip.ID()).
-							Error("failed to kill init's children")
-					}
-				}
-			}
-			p.SetExited(e.Status)
-			s.events <- &eventstypes.TaskExit{
-				ContainerID: s.id,
-				ID:          p.ID(),
-				Pid:         uint32(e.Pid),
-				ExitStatus:  uint32(e.Status),
-				ExitedAt:    p.ExitedAt(),
-			}
-			return
+	var p process.Process
+	s.mu.Lock()
+	for _, proc := range s.processes {
+		if proc.Pid() == e.Pid {
+			p = proc
+			break
 		}
 	}
+	s.mu.Unlock()
+	if p == nil {
+		log.G(s.context).Debugf("process with id:%d wasn't found", e.Pid)
+		return
+	}
+	if ip, ok := p.(*process.Init); ok {
+		// Ensure all children are killed
+		if shouldKillAllOnExit(s.context, s.bundle) {
+			if err := ip.KillAll(s.context); err != nil {
+				log.G(s.context).WithError(err).WithField("id", ip.ID()).
+					Error("failed to kill init's children")
+			}
+		}
+	}
+
+	p.SetExited(e.Status)
+	s.events <- &eventstypes.TaskExit{
+		ContainerID: s.id,
+		ID:          p.ID(),
+		Pid:         uint32(e.Pid),
+		ExitStatus:  uint32(e.Status),
+		ExitedAt:    p.ExitedAt(),
+	}
 }
 
-func shouldKillAllOnExit(bundlePath string) (bool, error) {
+func shouldKillAllOnExit(ctx context.Context, bundlePath string) bool {
 	var bundleSpec specs.Spec
 	bundleConfigContents, err := ioutil.ReadFile(filepath.Join(bundlePath, "config.json"))
 	if err != nil {
-		return false, err
+		log.G(ctx).WithError(err).Error("shouldKillAllOnExit: failed to read config.json")
+		return true
 	}
-	json.Unmarshal(bundleConfigContents, &bundleSpec)
-
+	if err := json.Unmarshal(bundleConfigContents, &bundleSpec); err != nil {
+		log.G(ctx).WithError(err).Error("shouldKillAllOnExit: failed to unmarshal bundle json")
+		return true
+	}
 	if bundleSpec.Linux != nil {
 		for _, ns := range bundleSpec.Linux.Namespaces {
 			if ns.Type == specs.PIDNamespace && ns.Path == "" {
-				return false, nil
+				return false
 			}
 		}
 	}
-
-	return true, nil
+	return true
 }
 
 func (s *Service) getContainerPids(ctx context.Context, id string) ([]uint32, error) {

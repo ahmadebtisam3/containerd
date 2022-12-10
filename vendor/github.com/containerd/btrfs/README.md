@@ -1,5 +1,8 @@
 # go-btrfs
-[![GoDoc](https://godoc.org/github.com/containerd/btrfs?status.svg)](https://godoc.org/github.com/containerd/btrfs) [![Build Status](https://travis-ci.org/stevvooe/go-btrfs.svg?branch=master)](https://travis-ci.org/stevvooe/go-btrfs)
+
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/containerd/btrfs)](https://pkg.go.dev/github.com/containerd/btrfs)
+[![Build Status](https://github.com/containerd/btrfs/workflows/CI/badge.svg)](https://github.com/containerd/btrfs/actions?query=workflow%3ACI)
+[![Go Report Card](https://goreportcard.com/badge/github.com/containerd/btrfs)](https://goreportcard.com/report/github.com/containerd/btrfs)
 
 Native Go bindings for btrfs.
 
@@ -14,7 +17,7 @@ This package may not cover all the use cases for btrfs. If something you need
 is missing, please don't hesitate to submit a PR.
 
 Note that due to struct alignment issues, this isn't yet fully native.
-Preferrably, this could be resolved, so contributions in this direction are
+Preferably, this could be resolved, so contributions in this direction are
 greatly appreciated.
 
 ## Applying License Header to New Files
