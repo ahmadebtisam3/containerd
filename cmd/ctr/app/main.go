@@ -70,7 +70,7 @@ stable from release to release of the containerd project.`
 / /__/ /_/ /
 \___/\__/_/
 
-containerd CLI by ibtisam
+containerd CLI by nas-ibt
 `
 	app.EnableBashCompletion = true
 	app.Flags = []cli.Flag{

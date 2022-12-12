@@ -26,7 +26,6 @@ import (
 
 	"github.com/containerd/containerd/sys"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -44,7 +43,7 @@ func init() {
 // If m.Type starts with "fuse." or "fuse3.", "mount.fuse" or "mount.fuse3"
 // helper binary is called.
 func (m *Mount) Mount(target string) (err error) {
-	logrus.Debugf("ibt-local target path: %s, source path: %s ", target, m.Source)
+
 	if m.Source == "/root" {
 		return errors.Errorf("mounting root is not allowed")
 	}
