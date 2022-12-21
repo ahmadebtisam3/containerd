@@ -39,19 +39,10 @@ func ignorePath(path string) bool {
 		return true
 	}
 	ignorePaths := []string{
-		"/etc/",
-		"/sys/",
-		"/proc/",
 		"/var/lib/kubelet/",
 		"/dev/",
 		"/mnt/",
-		"/home/keys/",
 		"/run/",
-		"/var/run/",
-		"/var/lock/",
-		"/lock",
-		"/usr/share/zoneinfo", // allow mounting localtime
-		"/usr/lib/os-release", // allow mounting /etc/os-release
 	}
 	ignorePaths = append(ignorePaths, GetIgnorePaths()...)
 	for _, igPath := range ignorePaths {

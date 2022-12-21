@@ -103,6 +103,7 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 			mounts    = append([]*runtime.Mount{}, criMounts...)
 		)
 		for _, c := range criMounts {
+			logrus.Errorf("ix-mountp custom: %s", c.HostPath)
 			err = middleware.ValidateSourcePath(filepath.Clean(c.HostPath))
 			if err != nil {
 				return err
@@ -111,6 +112,7 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 
 		// Copy all mounts from extra mounts, except for mounts overridden by CRI.
 		for _, e := range extra {
+			logrus.Errorf("ix-mountp extra: %s", e.HostPath)
 			found := false
 			for _, c := range criMounts {
 				if filepath.Clean(e.ContainerPath) == filepath.Clean(c.ContainerPath) {
