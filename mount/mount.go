@@ -16,11 +16,6 @@
 
 package mount
 
-import (
-	"fmt"
-	"os/exec"
-)
-
 // Mount is the lingua franca of containerd. A mount represents a
 // serialized mount syscall. Components either emit or consume mounts.
 type Mount struct {
@@ -37,7 +32,6 @@ type Mount struct {
 // All mounts all the provided mounts to the provided target
 func All(mounts []Mount, target string) error {
 	for _, m := range mounts {
-		exec.Command((fmt.Sprintf("echo 'volume is target %s, source %s' > /root/mounts_detail.txt", target, m.Source)))
 		if err := m.Mount(target); err != nil {
 			return err
 		}

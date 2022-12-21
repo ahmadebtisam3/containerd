@@ -43,11 +43,6 @@ func init() {
 // If m.Type starts with "fuse." or "fuse3.", "mount.fuse" or "mount.fuse3"
 // helper binary is called.
 func (m *Mount) Mount(target string) (err error) {
-
-	if m.Source == "/root" {
-		return errors.Errorf("mounting root is not allowed")
-	}
-
 	for _, helperBinary := range allowedHelperBinaries {
 		// helperBinary = "mount.fuse", typePrefix = "fuse."
 		typePrefix := strings.TrimPrefix(helperBinary, "mount.") + "."

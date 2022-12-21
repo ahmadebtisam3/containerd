@@ -48,7 +48,7 @@ const usage = `
 / /__/ /_/ / / / / /_/ /_/ / / / / /  __/ /  / /_/ /
 \___/\____/_/ /_/\__/\__,_/_/_/ /_/\___/_/   \__,_/
 
-high performance container runtime truenas
+high performance container runtime
 `
 
 func init() {
