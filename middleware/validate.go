@@ -12,6 +12,7 @@ func ValidateSourcePath(path string) error {
 	}
 	validationErr, err := Call("chart.release.validate_host_source_path", path)
 	if err == nil && validationErr != nil {
+		logrus.Errorf("ix-mounte inside validation error %s", validationErr.(string))
 		return errors.Errorf(validationErr.(string))
 	}
 	return nil
