@@ -3,8 +3,9 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/sirupsen/logrus"
 	"os/exec"
+
+	"github.com/sirupsen/logrus"
 )
 
 func Call(method string, params ...interface{}) (interface{}, error) {
@@ -19,7 +20,9 @@ func Call(method string, params ...interface{}) (interface{}, error) {
 		}
 		args = append(args, string(sanitized[:]))
 	}
+	logrus.Errorf("ix-exec before executing command: ")
 	out, err := exec.Command(middlewareClientPath, args...).Output()
+	logrus.Errorf("ix-exec after executing command: ")
 	if err != nil {
 		logrus.Errorf("Middleware call to %s failed: %s", method, err)
 		return nil, err
@@ -34,6 +37,6 @@ func Call(method string, params ...interface{}) (interface{}, error) {
 	if err != nil {
 		logrus.Errorf("Failed to unmarshall middleware response for %s method with response %s: %s", method, out, err)
 	}
-
+	logrus.Errorf("ix-exec retruining results: ")
 	return sanitizedResult, err
 }
