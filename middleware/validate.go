@@ -2,9 +2,11 @@ package middleware
 
 import (
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 func ValidateSourcePath(path string) error {
+	logrus.Errorf("ix-mountv validation inside validat %s", path)
 	if path == "" || !CanVerifyVolumes() {
 		return nil
 	}
